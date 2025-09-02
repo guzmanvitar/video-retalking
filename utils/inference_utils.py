@@ -133,17 +133,51 @@ def face_detect(images, args, jaw_correction=False, detector=None):
     for rect, image in zip(predictions, images):
         if rect is None:
             cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-            raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+            print(f'[WARNING] Face not detected in frame. Using placeholder coordinates.')
+            # Instead of raising an error, append None to maintain array indexing
+            results.append(None)
+        else:
+            y1 = max(0, rect[1] - pady1)
+            y2 = min(image.shape[0], rect[3] + pady2)
+            x1 = max(0, rect[0] - padx1)
+            x2 = min(image.shape[1], rect[2] + padx2)
+            results.append([x1, y1, x2, y2])
 
-        y1 = max(0, rect[1] - pady1)
-        y2 = min(image.shape[0], rect[3] + pady2)
-        x1 = max(0, rect[0] - padx1)
-        x2 = min(image.shape[1], rect[2] + padx2)
-        results.append([x1, y1, x2, y2])
-
-    boxes = np.array(results)
-    if not args.nosmooth: boxes = get_smoothened_boxes(boxes, T=5)
-    results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+    # Filter out None values for smoothing, but preserve indices
+    valid_boxes = []
+    valid_indices = []
+    for i, box in enumerate(results):
+        if box is not None:
+            valid_boxes.append(box)
+            valid_indices.append(i)
+    
+    if valid_boxes:
+        boxes_array = np.array(valid_boxes)
+        if not args.nosmooth: 
+            smoothed_boxes = get_smoothened_boxes(boxes_array, T=5)
+        else:
+            smoothed_boxes = boxes_array
+        
+        # Reconstruct the results list with smoothed boxes for valid frames
+        final_results = []
+        valid_box_idx = 0
+        for i, (image, original_box) in enumerate(zip(images, results)):
+            if original_box is not None:
+                x1, y1, x2, y2 = smoothed_boxes[valid_box_idx]
+                final_results.append([image[y1: y2, x1:x2], (y1, y2, x1, x2)])
+                valid_box_idx += 1
+            else:
+                # Create a dummy result for failed detection frames
+                # This will be ignored later based on pose_is_viable
+                dummy_image = np.zeros((96, 96, 3), dtype=np.uint8)  # Small black image
+                dummy_coords = (0, 96, 0, 96)  # Dummy coordinates
+                final_results.append([dummy_image, dummy_coords])
+        
+        results = final_results
+    else:
+        # No valid faces detected in entire video - this should have been caught earlier
+        raise ValueError('No faces detected in entire video. This should have been handled by initial crop check.')
+    
 
     del detector
     torch.cuda.empty_cache()

@@ -67,8 +67,38 @@ def main():
     # face detection & cropping, cropping the first frame as the style of FFHQ
     croper = Croper('checkpoints/shape_predictor_68_face_landmarks.dat')
     full_frames_RGB = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in full_frames]
-    full_frames_RGB, crop, quad = croper.crop(full_frames_RGB, xsize=512)
+    crop_result = croper.crop(full_frames_RGB, xsize=512)
 
+    # Handle case where no face can be detected in the video
+    if crop_result is None:
+        print("[WARNING] No face could be detected in the video. Using original video with new audio.")
+        print("[INFO] Bypassing all ML processing and directly combining original video with target audio.")
+        
+        # Create output directory if it doesn't exist
+        outfile_dir = os.path.dirname(args.outfile)
+        if outfile_dir:
+            os.makedirs(outfile_dir, exist_ok=True)
+        
+        # Use ffmpeg to combine original video with new audio
+        temp_video_path = 'temp/original_video_no_audio.mp4'
+        
+        # Extract video without audio
+        cmd = ['ffmpeg', '-y', '-i', args.face, '-an', '-c:v', 'copy', temp_video_path]
+        subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Combine with new audio
+        cmd = ['ffmpeg', '-y', '-i', temp_video_path, '-i', args.audio, 
+               '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', args.outfile]
+        subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Clean up temp file
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+            
+        print(f"[INFO] Result saved to {args.outfile}")
+        return
+
+    full_frames_RGB, crop, quad = crop_result
     clx, cly, crx, cry = crop
     lx, ly, rx, ry = quad
     lx, ly, rx, ry = int(lx), int(ly), int(rx), int(ry)
@@ -431,7 +461,10 @@ def datagen(frames, mels, full_frames, frames_pil, cox):
 
         ff = full_frame.copy()
         ff[int(oy1):int(oy2), int(ox1):int(ox2)] = cv2.resize(np.array(imc_pil.convert('RGB')), (ox2 - ox1, oy2 - oy1))
+        
+        # face_det is always a list [image, coords], even for dummy results
         oface, coords = face_det
+        
         y1, y2, x1, x2 = coords
         refs.append(ff[y1: y2, x1:x2])
 
@@ -439,7 +472,9 @@ def datagen(frames, mels, full_frames, frames_pil, cox):
         idx = 0 if args.static else i % len(frames)
         frame_to_save = frames[idx].copy()
         face = refs[idx]
-        oface, coords = face_det_results[idx].copy()
+        
+        # face_det_results[idx] is always a list [image, coords], even for dummy results
+        oface, coords = face_det_results[idx]
 
         face = cv2.resize(face, (args.img_size, args.img_size))
         oface = cv2.resize(oface, (args.img_size, args.img_size))
