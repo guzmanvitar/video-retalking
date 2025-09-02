@@ -22,7 +22,8 @@ from utils import audio
 from utils.ffhq_preprocess import Croper
 from utils.alignment_stit import crop_faces, calc_alignment_coefficients, paste_image
 from utils.inference_utils import Laplacian_Pyramid_Blending_with_mask, face_detect, load_model, options, split_coeff, \
-                                  trans_image, transform_semantic, find_crop_norm_ratio, load_face3d_net, exp_aus_dict
+                                  trans_image, transform_semantic, find_crop_norm_ratio, load_face3d_net, exp_aus_dict, estimate_pose_from_landmarks, \
+                                  calculate_pose_confidence_score, apply_schmitt_trigger, apply_state_machine, fix_boundary_flickers, apply_temporal_smoothing
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -90,15 +91,27 @@ def main():
         lm3d_std = load_lm3d('checkpoints/BFM')
 
         video_coeffs = []
+        
+        # Stage 1: Collect raw confidence scores
+        raw_confidence_scores = []
+        smoothed_confidence_scores = []
+        ema_alpha = 0.6  # Exponential moving average smoothing factor - increased for more responsiveness
+        
+        print(f"[Stage 1] Collecting raw pose confidence scores...")
+        
         for idx in tqdm(range(len(frames_pil)), desc="[Step 2] 3DMM Extraction In Video:"):
             frame = frames_pil[idx]
             W, H = frame.size
             lm_idx = lm[idx].reshape([-1, 2])
-            if np.mean(lm_idx) == -1:
+            
+            landmark_detection_failed = (np.mean(lm_idx) == -1)
+            if landmark_detection_failed:
+                # The rest of the fallback logic remains to ensure coeffs array has consistent shape
                 lm_idx = (lm3d_std[:, :2]+1) / 2.
                 lm_idx = np.concatenate([lm_idx[:, :1] * W, lm_idx[:, 1:2] * H], 1)
             else:
                 lm_idx[:, -1] = H - 1 - lm_idx[:, -1]
+
 
             trans_params, im_idx, lm_idx, _ = align_img(frame, lm_idx, lm3d_std)
             trans_params = np.array([float(item) for item in np.hsplit(trans_params, 5)]).astype(np.float32)
@@ -106,15 +119,98 @@ def main():
             with torch.no_grad():
                 coeffs = split_coeff(net_recon(im_idx_tensor))
 
+            # --- Stage 1: Calculate Raw Confidence Score ---
+            if landmark_detection_failed:
+                # No face detected - very low confidence
+                raw_confidence = 0.0
+                pitch_3dmm_deg, yaw_3dmm_deg = 0.0, 0.0
+                lm_confidence = 0.0
+                print(f"Frame {idx}: No landmarks - raw_confidence=0.0")
+            else:
+                # Method 1: 3DMM-based angle detection
+                angles = coeffs['angle'].cpu().numpy()[0] # [pitch, yaw, roll]
+                pitch_3dmm, yaw_3dmm, _ = angles
+                pitch_threshold = getattr(args, 'pose_pitch_threshold', args.pose_angle_threshold)
+                yaw_threshold = getattr(args, 'pose_yaw_threshold', args.pose_angle_threshold)
+                
+                # Convert from radians to degrees
+                if abs(pitch_3dmm) < 6.28 and abs(yaw_3dmm) < 6.28:  # Likely radians
+                    pitch_3dmm_deg = np.degrees(pitch_3dmm)
+                    yaw_3dmm_deg = np.degrees(yaw_3dmm)
+                else:  # Already in degrees
+                    pitch_3dmm_deg = pitch_3dmm
+                    yaw_3dmm_deg = yaw_3dmm
+                
+                # Method 2: Landmark-based pose detection with confidence
+                lm_current = lm[idx].reshape([-1, 2])
+                pitch_lm_deg, yaw_lm_deg, lm_confidence = estimate_pose_from_landmarks(lm_current)
+                
+                # Calculate unified confidence score using OR logic
+                raw_confidence = calculate_pose_confidence_score(
+                    pitch_3dmm_deg, yaw_3dmm_deg, lm_confidence, 
+                    pitch_threshold, yaw_threshold
+                )
+                
+                # Additional check: if our landmark-based pose detection finds extreme angles, override
+                if pitch_lm_deg is not None and yaw_lm_deg is not None:
+                    if abs(pitch_lm_deg) >= pitch_threshold or abs(yaw_lm_deg) >= yaw_threshold:
+                        raw_confidence = 0.2  # Override to low confidence if landmarks detect extreme pose
+                        print(f"Frame {idx}: Landmark override - pitch_lm={pitch_lm_deg:.1f}°, yaw_lm={yaw_lm_deg:.1f}°")
+                
+                print(f"Frame {idx}: 3DMM: pitch={pitch_3dmm_deg:.1f}°, yaw={yaw_3dmm_deg:.1f}° | LM: conf={lm_confidence:.2f} | Raw score: {raw_confidence:.3f}")
+            
+            raw_confidence_scores.append(raw_confidence)
+            
+            # Apply exponential moving average smoothing
+            if idx == 0:
+                smoothed_score = raw_confidence
+            else:
+                smoothed_score = ema_alpha * raw_confidence + (1 - ema_alpha) * smoothed_confidence_scores[-1]
+            smoothed_confidence_scores.append(smoothed_score)
+
             pred_coeff = {key:coeffs[key].cpu().numpy() for key in coeffs}
             pred_coeff = np.concatenate([pred_coeff['id'], pred_coeff['exp'], pred_coeff['tex'], pred_coeff['angle'],\
                                          pred_coeff['gamma'], pred_coeff['trans'], trans_params[None]], 1)
             video_coeffs.append(pred_coeff)
         semantic_npy = np.array(video_coeffs)[:,0]
         np.save('temp/'+base_name+'_coeffs.npy', semantic_npy)
+        
+        # --- Simple Pose Viability Logic ---
+        print(f"\n[Stage 2] Applying simple pose viability logic...")
+        print(f"Raw confidence scores: min={min(raw_confidence_scores):.3f}, max={max(raw_confidence_scores):.3f}, mean={np.mean(raw_confidence_scores):.3f}")
+        
+        # Simple threshold-based decision
+        threshold = 0.4  # Simple threshold: below this = not viable
+        pose_is_viable_raw = [score >= threshold for score in raw_confidence_scores]
+        
+        print(f"Simple threshold (0.4): {sum(pose_is_viable_raw)}/{len(pose_is_viable_raw)} frames marked viable")
+        
+        # Apply temporal smoothing: flip V islands of size <= n
+        island_size = 2  # Start with flipping V islands of size 2 or less
+        pose_is_viable = apply_temporal_smoothing(pose_is_viable_raw, island_size)
+        
+        print(f"After temporal smoothing (island_size={island_size}): {sum(pose_is_viable)}/{len(pose_is_viable)} frames marked viable")
+        
+        # Debug: Print final sequence pattern
+        pattern = ''.join(['V' if v else 'N' for v in pose_is_viable])
+        print(f"Final pattern: {pattern}")
+        
+        # Debug: Print frame-by-frame comparison
+        print(f"\nFrame-by-frame comparison:")
+        print("Frame | Raw   | Raw V/N| Final")
+        print("------|-------|--------|------")
+        for i in range(min(20, len(pose_is_viable))):  # Show first 20 frames
+            print(f"{i:5d} | {raw_confidence_scores[i]:.3f} | {'V' if pose_is_viable_raw[i] else 'N':7s} | {'V' if pose_is_viable[i] else 'N':5s}")
+        if len(pose_is_viable) > 20:
+            print("...")
+            for i in range(max(20, len(pose_is_viable)-10), len(pose_is_viable)):  # Show last 10 frames
+                print(f"{i:5d} | {raw_confidence_scores[i]:.3f} | {'V' if pose_is_viable_raw[i] else 'N':7s} | {'V' if pose_is_viable[i] else 'N':5s}")
     else:
         print('[Step 2] Using saved coeffs.')
         semantic_npy = np.load('temp/'+base_name+'_coeffs.npy').astype(np.float32)
+        # If using cached coeffs, we need to initialize pose_is_viable with all True
+        # This means we accept all poses when using cached data
+        pose_is_viable = [True] * len(semantic_npy)
 
     # generate the 3dmm coeff from a single image
     if args.exp_img is not None and ('.png' in args.exp_img or '.jpg' in args.exp_img):
@@ -181,6 +277,15 @@ def main():
     if np.isnan(mel.reshape(-1)).sum() > 0:
         raise ValueError('Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
 
+    # --- New Silence Detection Logic ---
+    is_speech_present = []
+    wav_step_size = 16000 // int(fps) # samples per frame
+    for i in range(0, len(wav), wav_step_size):
+        chunk = wav[i : i + wav_step_size]
+        if len(chunk) > 0:
+            is_speech_present.append(not audio.is_silent(chunk))
+    # --- End New Logic ---
+
     mel_step_size, mel_idx_multiplier, i, mel_chunks = 16, 80./fps, 0, []
     while True:
         start_idx = int(i * mel_idx_multiplier)
@@ -194,12 +299,18 @@ def main():
     imgs = imgs[:len(mel_chunks)]
     full_frames = full_frames[:len(mel_chunks)]  
     lm = lm[:len(mel_chunks)]
+    # Also truncate pose viability array to match audio length
+    pose_is_viable = pose_is_viable[:len(mel_chunks)]
     
     imgs_enhanced = []
     for idx in tqdm(range(len(imgs)), desc='[Step 5] Reference Enhancement'):
         img = imgs[idx]
-        pred, _, _ = enhancer.process(img, img, face_enhance=True, possion_blending=False)
-        imgs_enhanced.append(pred)
+        try:
+            pred, _, _ = enhancer.process(img, img, face_enhance=True, possion_blending=False)
+            imgs_enhanced.append(pred)
+        except Exception as e:
+            print(f"Warning: Face enhancement failed for frame {idx}, using original image. Error: {e}")
+            imgs_enhanced.append(img)
     gen = datagen(imgs_enhanced.copy(), mel_chunks, full_frames, None, (oy1,oy2,ox1,ox2))
 
     frame_h, frame_w = full_frames[0].shape[:-1]
@@ -243,33 +354,53 @@ def main():
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 
         torch.cuda.empty_cache()
-        for p, f, xf, c in zip(pred, frames, f_frames, coords):
+        
+        batch_start_index = i * args.LNet_batch_size
+        for j, (p, f, xf, c) in enumerate(zip(pred, frames, f_frames, coords)):
+            frame_index = batch_start_index + j
+
+            if not pose_is_viable[frame_index]:
+                # If pose is not viable, write the original full frame and continue
+                print(f"Using original frame for frame {frame_index} (pose not viable)")
+                out.write(xf) 
+                continue
+
             y1, y2, x1, x2 = c
-            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-            
-            ff = xf.copy() 
-            ff[y1:y2, x1:x2] = p
-            
-            # month region enhancement by GFPGAN
-            cropped_faces, restored_faces, restored_img = restorer.enhance(
-                ff, has_aligned=False, only_center_face=True, paste_back=True)
-                # 0,   1,   2,   3,   4,   5,   6,   7,   8,  9, 10,  11,  12,
-            mm = [0,   0,   0,   0,   0,   0,   0,   0,   0,  0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
-            mouse_mask = np.zeros_like(restored_img)
-            tmp_mask = enhancer.faceparser.process(restored_img[y1:y2, x1:x2], mm)[0]
-            mouse_mask[y1:y2, x1:x2]= cv2.resize(tmp_mask, (x2 - x1, y2 - y1))[:, :, np.newaxis] / 255.
 
-            height, width = ff.shape[:2]
-            restored_img, ff, full_mask = [cv2.resize(x, (512, 512)) for x in (restored_img, ff, np.float32(mouse_mask))]
-            img = Laplacian_Pyramid_Blending_with_mask(restored_img, ff, full_mask[:, :, 0], 10)
-            pp = np.uint8(cv2.resize(np.clip(img, 0 ,255), (width, height)))
+            if is_speech_present[frame_index]:
+                # Speech is present, use the normal lip-sync + enhancement pipeline
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                
+                ff = xf.copy() 
+                ff[y1:y2, x1:x2] = p
+                
+                # month region enhancement by GFPGAN
+                cropped_faces, restored_faces, restored_img = restorer.enhance(
+                    ff, has_aligned=False, only_center_face=True, paste_back=True)
+                    # 0,   1,   2,   3,   4,   5,   6,   7,   8,  9, 10,  11,  12,
+                mm = [0,   0,   0,   0,   0,   0,   0,   0,   0,  0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
+                mouse_mask = np.zeros_like(restored_img)
+                tmp_mask = enhancer.faceparser.process(restored_img[y1:y2, x1:x2], mm)[0]
+                mouse_mask[y1:y2, x1:x2]= cv2.resize(tmp_mask, (x2 - x1, y2 - y1))[:, :, np.newaxis] / 255.
 
-            pp, orig_faces, enhanced_faces = enhancer.process(pp, xf, bbox=c, face_enhance=False, possion_blending=True)
+                height, width = ff.shape[:2]
+                restored_img, ff, full_mask = [cv2.resize(x, (512, 512)) for x in (restored_img, ff, np.float32(mouse_mask))]
+                img = Laplacian_Pyramid_Blending_with_mask(restored_img, ff, full_mask[:, :, 0], 10)
+                pp = np.uint8(cv2.resize(np.clip(img, 0 ,255), (width, height)))
+
+                pp, orig_faces, enhanced_faces = enhancer.process(pp, xf, bbox=c, face_enhance=False, possion_blending=True)
+            else:
+                # Silence, use the stabilized frame without additional enhancement
+                # `imgs` holds the stabilized frames from Step 3
+                stabilized_frame = f # `f` is the stabilized frame from the generator
+                pp = stabilized_frame
+
             out.write(pp)
     out.release()
     
-    if not os.path.isdir(os.path.dirname(args.outfile)):
-        os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
+    outfile_dir = os.path.dirname(args.outfile)
+    if outfile_dir and not os.path.isdir(outfile_dir):
+        os.makedirs(outfile_dir, exist_ok=True)
     command = 'ffmpeg -loglevel error -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/{}/result.mp4'.format(args.tmp_dir), args.outfile)
     subprocess.call(command, shell=platform.system() != 'Windows')
     print('outfile:', args.outfile)

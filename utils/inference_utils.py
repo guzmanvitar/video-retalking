@@ -44,6 +44,9 @@ def options():
     parser.add_argument('--without_rl1', default=False, action='store_true', help='Do not use the relative l1')
     parser.add_argument('--tmp_dir', type=str, default='temp', help='Folder to save tmp results')
     parser.add_argument('--re_preprocess', action='store_true')
+    parser.add_argument('--pose_angle_threshold', type=float, default=60., help='Threshold for head pose angle (pitch or yaw) beyond which the original frame is used.')
+    parser.add_argument('--pose_pitch_threshold', type=float, default=30., help='Threshold for head pitch angle (up/down) beyond which the original frame is used.')
+    parser.add_argument('--pose_yaw_threshold', type=float, default=60., help='Threshold for head yaw angle (left/right) beyond which the original frame is used.')
     
     args = parser.parse_args()
     return args
@@ -251,3 +254,303 @@ def load_face3d_net(ckpt_path, device):
     net_recon.load_state_dict(checkpoint['net_recon'])
     net_recon.eval()
     return net_recon
+
+def estimate_pose_from_landmarks(landmarks):
+    """
+    Estimate head pose angles from 68 facial landmarks with confidence checking.
+    Returns (pitch, yaw, confidence) in degrees.
+    
+    Args:
+        landmarks: numpy array of shape (68, 2) with (x, y) coordinates
+    
+    Returns:
+        tuple: (pitch_deg, yaw_deg, confidence) - confidence is 0.0-1.0, None values if unreliable
+    """
+    if landmarks is None or np.mean(landmarks) == -1:
+        return None, None, 0.0
+    
+    # Key landmark indices (68-point model)
+    nose_tip = 30  # tip of nose
+    chin = 8       # bottom of chin
+    left_eye_corner = 36   # left eye outer corner
+    right_eye_corner = 45  # right eye outer corner
+    left_mouth = 48        # left corner of mouth
+    right_mouth = 54       # right corner of mouth
+    
+    # Extract key points
+    try:
+        nose = landmarks[nose_tip]
+        chin_pt = landmarks[chin]
+        left_eye = landmarks[left_eye_corner]
+        right_eye = landmarks[right_eye_corner]
+        left_mouth_pt = landmarks[left_mouth]
+        right_mouth_pt = landmarks[right_mouth]
+    except (IndexError, TypeError):
+        return None, None, 0.0
+    
+    # Quality checks for landmark detection
+    confidence = 1.0
+    
+    # Check 1: Are landmarks within reasonable bounds? (assuming image is ~256x256)
+    all_points = np.array([nose, chin_pt, left_eye, right_eye, left_mouth_pt, right_mouth_pt])
+    if np.any(all_points < 0) or np.any(all_points > 300):
+        confidence *= 0.3  # Very low confidence for out-of-bounds points
+    
+    # Check 2: Are the landmarks forming a reasonable face shape?
+    eye_distance = np.linalg.norm(right_eye - left_eye)
+    face_height = np.linalg.norm(chin_pt - ((left_eye + right_eye) / 2))
+    
+    if eye_distance < 10 or face_height < 20:  # Face too small
+        confidence *= 0.2
+    if eye_distance > 150 or face_height > 200:  # Face too large
+        confidence *= 0.2
+    
+    # Check 3: Are eyes at reasonable positions relative to each other?
+    if abs(left_eye[1] - right_eye[1]) > 20:  # Eyes not horizontally aligned
+        confidence *= 0.5
+    
+    # Check 4: Is nose between the eyes horizontally?
+    eye_center_x = (left_eye[0] + right_eye[0]) / 2
+    if abs(nose[0] - eye_center_x) > eye_distance:  # Nose too far from eye center
+        confidence *= 0.3
+    
+    # If confidence is too low, don't trust the landmarks
+    if confidence < 0.4:
+        return None, None, confidence
+    
+    # Calculate face center and dimensions
+    face_center_x = (left_eye[0] + right_eye[0]) / 2
+    face_center_y = (left_eye[1] + right_eye[1]) / 2
+    
+    # Estimate pitch (up/down) from nose-chin relationship
+    # When looking down, nose moves closer to chin
+    eye_level_y = face_center_y
+    
+    # Vertical offset of nose from eye level (normalized)
+    nose_offset_y = (nose[1] - eye_level_y) 
+    
+    if face_height > 0:
+        # Positive values indicate looking down
+        pitch_ratio = nose_offset_y / face_height
+        pitch_deg = pitch_ratio * 45  # Scale to reasonable degree range
+    else:
+        pitch_deg = 0
+    
+    # Estimate yaw (left/right) from eye symmetry and nose position
+    nose_offset_x = nose[0] - eye_center_x
+    
+    if eye_distance > 0:
+        yaw_ratio = nose_offset_x / eye_distance
+        yaw_deg = yaw_ratio * 60  # Scale to reasonable degree range
+    else:
+        yaw_deg = 0
+    
+    # Sanity check on final angles
+    if abs(pitch_deg) > 90 or abs(yaw_deg) > 90:
+        confidence *= 0.1  # Very unreliable if angles are extreme
+        return None, None, confidence
+    
+    return pitch_deg, yaw_deg, confidence
+
+def calculate_pose_confidence_score(pitch_3dmm_deg, yaw_3dmm_deg, lm_confidence, pitch_threshold=30, yaw_threshold=60):
+    """
+    Calculate a unified pose confidence score (0-1) from multiple signals.
+    Higher score = more confident the pose is viable for lip-sync.
+    
+    Args:
+        pitch_3dmm_deg: 3DMM pitch angle in degrees
+        yaw_3dmm_deg: 3DMM yaw angle in degrees  
+        lm_confidence: Landmark detection confidence (0-1)
+        pitch_threshold: Maximum acceptable pitch angle
+        yaw_threshold: Maximum acceptable yaw angle
+    
+    Returns:
+        float: Confidence score between 0 and 1
+    """
+    # OR logic: if ANY of these conditions are true, return low confidence
+    # Condition 1: 3DMM model angles exceed thresholds
+    if abs(pitch_3dmm_deg) >= pitch_threshold or abs(yaw_3dmm_deg) >= yaw_threshold:
+        return 0.2  # Low confidence for extreme poses detected by 3DMM
+    
+    # Condition 2: Landmark detection confidence is too low (unreliable detection)
+    if lm_confidence < 0.5:  # Threshold for reliable landmark detection
+        return 0.2  # Low confidence when landmarks are unreliable
+    
+    # If we pass both checks, pose is likely viable
+    return 0.8  # High confidence for acceptable poses
+
+def apply_schmitt_trigger(scores, high_thresh=0.7, low_thresh=0.3):
+    """
+    Apply Schmitt trigger (hysteresis) to smooth binary decisions.
+    
+    Args:
+        scores: List of confidence scores (0-1)
+        high_thresh: Threshold to switch to True (viable)
+        low_thresh: Threshold to switch to False (not viable)
+    
+    Returns:
+        list: Binary decisions with hysteresis
+    """
+    if not scores:
+        return []
+    
+    decisions = []
+    current_state = None  # Start unknown
+    
+    for score in scores:
+        if current_state is None:
+            # Initialize based on first score
+            current_state = score > (high_thresh + low_thresh) / 2
+        elif current_state and score < low_thresh:
+            # Currently True, switch to False if below low threshold
+            current_state = False
+        elif not current_state and score > high_thresh:
+            # Currently False, switch to True if above high threshold  
+            current_state = True
+        # Otherwise maintain current state
+        
+        decisions.append(current_state)
+    
+    return decisions
+
+def apply_state_machine(binary_intents, turn_on_frames=3, turn_off_frames=2, cooldown_frames=3):
+    """
+    Apply conservative state machine with asymmetric switching and cooldown.
+    
+    Args:
+        binary_intents: List of binary intentions from Schmitt trigger
+        turn_on_frames: Consecutive frames needed to enable lip-sync
+        turn_off_frames: Consecutive frames needed to disable lip-sync
+        cooldown_frames: Frames to wait after turning off before allowing turn on
+    
+    Returns:
+        list: Final binary decisions
+    """
+    if not binary_intents:
+        return []
+    
+    decisions = []
+    state = False  # Start with lip-sync OFF (conservative)
+    consecutive_on = 0
+    consecutive_off = 0
+    cooldown_remaining = 0
+    
+    for intent in binary_intents:
+        # Handle cooldown
+        if cooldown_remaining > 0:
+            cooldown_remaining -= 1
+            decisions.append(False)  # Force OFF during cooldown
+            consecutive_on = 0
+            consecutive_off = 0
+            continue
+        
+        if intent:  # Intent is ON (viable pose)
+            consecutive_on += 1
+            consecutive_off = 0
+            
+            # Hard to turn ON: need multiple consecutive frames
+            if consecutive_on >= turn_on_frames:
+                state = True
+        else:  # Intent is OFF (non-viable pose)
+            consecutive_off += 1
+            consecutive_on = 0
+            
+            # Easy to turn OFF: need fewer consecutive frames
+            if consecutive_off >= turn_off_frames and state:
+                state = False
+                cooldown_remaining = cooldown_frames
+        
+        decisions.append(state)
+    
+    return decisions
+
+def apply_temporal_smoothing(decisions, island_size=2):
+    """
+    Apply temporal smoothing by flipping small V islands to N.
+    
+    Args:
+        decisions: List of binary decisions (True=Viable, False=Not viable)
+        island_size: Maximum size of V island to flip to N
+    
+    Returns:
+        list: Decisions with temporal smoothing applied
+    """
+    if len(decisions) < 3:
+        return decisions
+    
+    result = decisions.copy()
+    n = len(result)
+    
+    # Find and flip small V islands
+    i = 0
+    while i < n:
+        if result[i]:  # Found a V
+            # Count consecutive V's
+            v_count = 0
+            j = i
+            while j < n and result[j]:
+                v_count += 1
+                j += 1
+            
+            # If V island is small, flip it to N
+            if v_count <= island_size:
+                for k in range(i, j):
+                    result[k] = False
+                print(f"Flipped V island of size {v_count} at frames {i}-{j-1} to N")
+            
+            i = j  # Skip to after the V island
+        else:
+            i += 1
+    
+    return result
+
+def fix_boundary_flickers(decisions, island_size=2):
+    """
+    Fix short contradictory runs at start/end of sequence.
+    
+    Args:
+        decisions: List of binary decisions
+        island_size: Maximum size of contradictory island to flip
+    
+    Returns:
+        list: Decisions with boundary flickers fixed
+    """
+    if len(decisions) < 4:
+        return decisions
+    
+    result = decisions.copy()
+    n = len(result)
+    
+    # Fix start islands: N N V V V V → V V V V V V
+    start_value = result[0]
+    start_run_length = 0
+    for i in range(n):
+        if result[i] == start_value:
+            start_run_length += 1
+        else:
+            break
+    
+    if start_run_length <= island_size and start_run_length < n - start_run_length:
+        # Short contradictory start, flip it to match the following majority
+        following_value = result[start_run_length]
+        for i in range(start_run_length):
+            result[i] = following_value
+        print(f"Fixed start island: flipped first {start_run_length} frames from {start_value} to {following_value}")
+    
+    # Fix end islands: V V V V N N → V V V V V V  
+    end_value = result[-1]
+    end_run_length = 0
+    for i in range(n-1, -1, -1):
+        if result[i] == end_value:
+            end_run_length += 1
+        else:
+            break
+    
+    if end_run_length <= island_size and end_run_length < n - end_run_length:
+        # Short contradictory end, flip it to match the preceding majority
+        preceding_value = result[n - end_run_length - 1]
+        for i in range(n - end_run_length, n):
+            result[i] = preceding_value
+        print(f"Fixed end island: flipped last {end_run_length} frames from {end_value} to {preceding_value}")
+    
+    return result

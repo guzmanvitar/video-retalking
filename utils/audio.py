@@ -134,3 +134,11 @@ def _denormalize(D):
         return (((D + hp.max_abs_value) * -hp.min_level_db / (2 * hp.max_abs_value)) + hp.min_level_db)
     else:
         return ((D * -hp.min_level_db / hp.max_abs_value) + hp.min_level_db)
+
+
+def is_silent(wav_chunk, silence_threshold=0.01):
+    """
+    Check if a chunk of audio waveform is silent based on its RMS energy.
+    """
+    rms = np.sqrt(np.mean(wav_chunk**2))
+    return rms < silence_threshold
