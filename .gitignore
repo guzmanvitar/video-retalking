@@ -13,3 +13,5 @@ results/*
 temp/*
 segments.txt
 .DS_Store
+.cog
+np
