@@ -329,8 +329,9 @@ def main():
     imgs = imgs[:len(mel_chunks)]
     full_frames = full_frames[:len(mel_chunks)]  
     lm = lm[:len(mel_chunks)]
-    # Also truncate pose viability array to match audio length
+    # Also truncate pose viability array and speech detection array to match audio length
     pose_is_viable = pose_is_viable[:len(mel_chunks)]
+    is_speech_present = is_speech_present[:len(mel_chunks)]
     
     imgs_enhanced = []
     for idx in tqdm(range(len(imgs)), desc='[Step 5] Reference Enhancement'):
