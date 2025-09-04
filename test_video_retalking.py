@@ -49,8 +49,10 @@ def run_video_retalking_with_debug(face_video: Path, audio_path: Path, output_pa
     
     cmd = [
         "docker", "run", "--rm",
+        "--gpus", "all",
+        "--ipc=host", "--shm-size=16g",
         "-v", f"{workspace_root}:/workspace",
-        "-v", f"{cache_dir}:/root/.pyenv/versions/3.11.13/lib/python3.11/site-packages/facexlib/weights",
+        "-v", f"{cache_dir}:/root/.cache/facexlib/weights",
         "-w", "/workspace",
         "cog-video-retalking",
         "python", "inference.py",
@@ -59,7 +61,7 @@ def run_video_retalking_with_debug(face_video: Path, audio_path: Path, output_pa
         "--outfile", str(output_path_rel),
         "--pose_pitch_threshold", "30",
         "--pose_yaw_threshold", "60",
-        "--re_preprocess"  # Force reprocessing for consistent debug output
+        "--re_preprocess",
     ]
 
     logger.info(f"[VIDEO-RETALKING] Running: {' '.join(cmd)}")
