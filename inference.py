@@ -34,9 +34,9 @@ def main():
     print('[Info] Using {} for inference.'.format(device))
     os.makedirs(os.path.join('temp', args.tmp_dir), exist_ok=True)
 
-    enhancer = FaceEnhancement(base_dir='checkpoints', size=512, model='GPEN-BFR-512', use_sr=False, \
+    enhancer = None if getattr(args, 'no_gpen', False) else FaceEnhancement(base_dir='checkpoints', size=512, model='GPEN-BFR-512', use_sr=False, \
                                sr_model='rrdb_realesrnet_psnr', channel_multiplier=2, narrow=1, device=device)
-    restorer = GFPGANer(model_path='checkpoints/GFPGANv1.3.pth', upscale=1, arch='clean', \
+    restorer = None if getattr(args, 'no_gfpgan', False) else GFPGANer(model_path='checkpoints/GFPGANv1.3.pth', upscale=1, arch='clean', \
                         channel_multiplier=2, bg_upsampler=None)
 
     base_name = args.face.split('/')[-1]
@@ -273,7 +273,10 @@ def main():
     # load DNet, model(LNet and ENet)
     D_Net, model = load_model(args, device)
 
-    if not os.path.isfile('temp/'+base_name+'_stablized.npy') or args.re_preprocess:
+    if getattr(args, 'skip_stabilize', False):
+        print('[Step 3] Skipping stabilization as requested.')
+        imgs = [cv2.resize(np.array(f), (256, 256)) for f in frames_pil]
+    elif not os.path.isfile('temp/'+base_name+'_stablized.npy') or args.re_preprocess:
         imgs = []
         for idx in tqdm(range(len(frames_pil)), desc="[Step 3] Stabilize the expression In Video:"):
             if args.one_shot:
@@ -288,7 +291,11 @@ def main():
             # hacking the new expression
             coeff[:, :64, :] = expression[None, :64, None].to(device) 
             with torch.no_grad():
-                output = D_Net(source_img, coeff)
+                if getattr(args, 'amp', False) and device == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        output = D_Net(source_img, coeff)
+                else:
+                    output = D_Net(source_img, coeff)
             img_stablized = np.uint8((output['fake_image'].squeeze(0).permute(1,2,0).cpu().clamp_(-1, 1).numpy() + 1 )/2. * 255)
             imgs.append(cv2.cvtColor(img_stablized,cv2.COLOR_RGB2BGR)) 
         np.save('temp/'+base_name+'_stablized.npy',imgs)
@@ -334,15 +341,21 @@ def main():
     is_speech_present = is_speech_present[:len(mel_chunks)]
     
     imgs_enhanced = []
-    for idx in tqdm(range(len(imgs)), desc='[Step 5] Reference Enhancement'):
-        img = imgs[idx]
-        try:
-            pred, _, _ = enhancer.process(img, img, face_enhance=True, possion_blending=False)
-            imgs_enhanced.append(pred)
-        except Exception as e:
-            print(f"Warning: Face enhancement failed for frame {idx}, using original image. Error: {e}")
-            imgs_enhanced.append(img)
+    if enhancer is None:
+        print('[Step 5] Skipping GPEN reference enhancement as requested.')
+        imgs_enhanced = imgs
+    else:
+        for idx in tqdm(range(len(imgs)), desc='[Step 5] Reference Enhancement'):
+            img = imgs[idx]
+            try:
+                pred, _, _ = enhancer.process(img, img, face_enhance=True, possion_blending=False)
+                imgs_enhanced.append(pred)
+            except Exception as e:
+                print(f"Warning: Face enhancement failed for frame {idx}, using original image. Error: {e}")
+                imgs_enhanced.append(img)
     gen = datagen(imgs_enhanced.copy(), mel_chunks, full_frames, None, (oy1,oy2,ox1,ox2))
+    if getattr(args, 'amp', False) and device == 'cuda':
+        torch.set_float32_matmul_precision('high')
 
     frame_h, frame_w = full_frames[0].shape[:-1]
     out = cv2.VideoWriter('temp/{}/result.mp4'.format(args.tmp_dir), cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_w, frame_h))
@@ -360,7 +373,11 @@ def main():
         
         with torch.no_grad():
             incomplete, reference = torch.split(img_batch, 3, dim=1) 
-            pred, low_res = model(mel_batch, img_batch, reference)
+            if getattr(args, 'amp', False) and device == 'cuda':
+                with torch.cuda.amp.autocast():
+                    pred, low_res = model(mel_batch, img_batch, reference)
+            else:
+                pred, low_res = model(mel_batch, img_batch, reference)
             pred = torch.clamp(pred, 0, 1)
 
             if args.up_face in ['sad', 'angry', 'surprise']:
@@ -405,21 +422,24 @@ def main():
                 ff = xf.copy() 
                 ff[y1:y2, x1:x2] = p
                 
-                # month region enhancement by GFPGAN
-                cropped_faces, restored_faces, restored_img = restorer.enhance(
-                    ff, has_aligned=False, only_center_face=True, paste_back=True)
-                    # 0,   1,   2,   3,   4,   5,   6,   7,   8,  9, 10,  11,  12,
-                mm = [0,   0,   0,   0,   0,   0,   0,   0,   0,  0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
-                mouse_mask = np.zeros_like(restored_img)
-                tmp_mask = enhancer.faceparser.process(restored_img[y1:y2, x1:x2], mm)[0]
-                mouse_mask[y1:y2, x1:x2]= cv2.resize(tmp_mask, (x2 - x1, y2 - y1))[:, :, np.newaxis] / 255.
+                if restorer is not None and enhancer is not None:
+                    # mouth region enhancement by GFPGAN
+                    cropped_faces, restored_faces, restored_img = restorer.enhance(
+                        ff, has_aligned=False, only_center_face=True, paste_back=True)
+                        # 0,   1,   2,   3,   4,   5,   6,   7,   8,  9, 10,  11,  12,
+                    mm = [0,   0,   0,   0,   0,   0,   0,   0,   0,  0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
+                    mouse_mask = np.zeros_like(restored_img)
+                    tmp_mask = enhancer.faceparser.process(restored_img[y1:y2, x1:x2], mm)[0]
+                    mouse_mask[y1:y2, x1:x2]= cv2.resize(tmp_mask, (x2 - x1, y2 - y1))[:, :, np.newaxis] / 255.
 
-                height, width = ff.shape[:2]
-                restored_img, ff, full_mask = [cv2.resize(x, (512, 512)) for x in (restored_img, ff, np.float32(mouse_mask))]
-                img = Laplacian_Pyramid_Blending_with_mask(restored_img, ff, full_mask[:, :, 0], 10)
-                pp = np.uint8(cv2.resize(np.clip(img, 0 ,255), (width, height)))
+                    height, width = ff.shape[:2]
+                    restored_img, ff, full_mask = [cv2.resize(x, (512, 512)) for x in (restored_img, ff, np.float32(mouse_mask))]
+                    img = Laplacian_Pyramid_Blending_with_mask(restored_img, ff, full_mask[:, :, 0], 10)
+                    pp = np.uint8(cv2.resize(np.clip(img, 0 ,255), (width, height)))
 
-                pp, orig_faces, enhanced_faces = enhancer.process(pp, xf, bbox=c, face_enhance=False, possion_blending=True)
+                    pp, orig_faces, enhanced_faces = enhancer.process(pp, xf, bbox=c, face_enhance=False, possion_blending=True)
+                else:
+                    pp = ff
             else:
                 # Silence, use the stabilized frame without additional enhancement
                 # `imgs` holds the stabilized frames from Step 3

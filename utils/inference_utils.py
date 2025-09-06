@@ -48,6 +48,12 @@ def options():
     parser.add_argument('--pose_pitch_threshold', type=float, default=30., help='Threshold for head pitch angle (up/down) beyond which the original frame is used.')
     parser.add_argument('--pose_yaw_threshold', type=float, default=60., help='Threshold for head yaw angle (left/right) beyond which the original frame is used.')
     
+    # Performance/quality trade-offs
+    parser.add_argument('--amp', action='store_true', help='Use torch.cuda.amp for D_Net and LNet inference')
+    parser.add_argument('--skip_stabilize', action='store_true', help='Skip D_Net stabilization (faster, lower quality)')
+    parser.add_argument('--no_gpen', action='store_true', help='Disable GPEN reference enhancement (Step 5)')
+    parser.add_argument('--no_gfpgan', action='store_true', help='Disable GFPGAN mouth region enhancement (within Step 6)')
+    
     args = parser.parse_args()
     return args
 
