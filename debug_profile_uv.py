@@ -183,7 +183,7 @@ def build_inference_cmd(uv_python: Path, inference_py: Path, face: Path, audio: 
 		"--face", str(face),
 		"--audio", str(audio),
 		"--outfile", str(outfile),
-		"--re_preprocess",
+		# Note: --re_preprocess removed to test cached performance
 	]
 	cmd.extend(extra_args)
 	return cmd
