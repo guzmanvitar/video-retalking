@@ -16,3 +16,5 @@ segments.txt
 .cog
 np
 test_clips
+.augment
+.venv
